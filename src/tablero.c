@@ -49,3 +49,41 @@ void iniciar_tablero(Tablero* tablero, int puma, const int dogs[12]){
     tablero->casillas[puma] = PUMA;
     for(int i = 0; i < 12; i++) tablero->casillas[dogs[i]] = i + 2;
 }
+
+// -1 invalido, 0 paso simple, positivo indice intermedio + 1.
+static int tipo_jugada(const Tablero* tablero, int ficha, Jugada jugada){
+    if(tablero->casillas[jugada.origen] != ficha || tablero->casillas[jugada.destino] != 0) return -1;
+    if(vecino[jugada.origen][jugada.destino]) return 0;
+    int paso = salto[jugada.origen][jugada.destino];
+    if(ficha == PUMA && paso && tablero->casillas[paso - 1] > PUMA) return paso;
+    return -1;
+}
+
+int jugadas_validas(const Tablero* tablero, int ficha, Jugada* jugadas){
+    int desde = 0, n = 0;
+    while(desde < CASILLAS && tablero->casillas[desde] != ficha) desde++;
+    if(desde == CASILLAS) return 0;
+    for(int i = 0; i < CASILLAS; i++){
+        Jugada jugada = {desde, i};
+        if(tipo_jugada(tablero, ficha, jugada) >= 0) jugadas[n++] = jugada;
+    }
+    return n;
+}
+
+bool aplicar_jugada(Tablero* tablero, int ficha, Jugada jugada, int* comio){
+    // El tablero puede haber cambiado mientras la solicitud esperaba en la cola.
+    int paso = tipo_jugada(tablero, ficha, jugada);
+    *comio = paso > 0;
+    if(paso < 0) return false;
+    if(paso > 0){
+        tablero->casillas[paso - 1] = 0;
+        tablero->capturas++;
+    }
+    tablero->casillas[jugada.origen] = 0;
+    tablero->casillas[jugada.destino] = ficha;
+    return true;
+}
+
+bool es_salto(Jugada jugada){
+    return !vecino[jugada.origen][jugada.destino];
+}
