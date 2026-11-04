@@ -84,6 +84,24 @@ bool aplicar_jugada(Tablero* tablero, int ficha, Jugada jugada, int* comio){
     return true;
 }
 
+Resultado resultado_tablero(const Tablero* tablero){
+    if(tablero->capturas >= 6) return RES_PUMA;
+    Jugada jugadas[CASILLAS];
+    if(jugadas_validas(tablero, PUMA, jugadas) == 0) return RES_PERROS;
+    return RES_JUGANDO;
+}
+
+void imprimir_tablero(const Tablero* tablero, FILE* salida){
+    char c[CASILLAS];
+    for(int i = 0; i < CASILLAS; i++)
+        c[i] = tablero->casillas[i] == PUMA ? 'P' : tablero->casillas[i] ? 'd' : '.';
+    fprintf(salida, "        %c\n      / | \\\n    %c---+---%c\n  / |   |   | \\\n", c[25], c[26], c[27]);
+    for(int i = 0; i < 25; i += 5){
+        fprintf(salida, "%c---%c---%c---%c---%c\n", c[i], c[i+1], c[i+2], c[i+3], c[i+4]);
+        if(i < 20) fputs("|   |   |   |   |\n", salida);
+    }
+}
+
 bool es_salto(Jugada jugada){
     return !vecino[jugada.origen][jugada.destino];
 }

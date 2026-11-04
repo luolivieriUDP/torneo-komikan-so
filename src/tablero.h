@@ -13,6 +13,8 @@ void preparar_grafo(void);
 void iniciar_tablero(Tablero* tablero, int puma, const int dogs[12]);
 int jugadas_validas(const Tablero* tablero, int ficha, Jugada* jugadas);
 bool aplicar_jugada(Tablero* tablero, int ficha, Jugada jugada, int* comio);
+Resultado resultado_tablero(const Tablero* tablero);
+void imprimir_tablero(const Tablero* tablero, FILE* salida);
 bool es_salto(Jugada jugada);
 
 #endif
