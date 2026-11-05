@@ -193,6 +193,34 @@ static void servidor_apagar(Servidor* servidor){
 
 // Clientes.
 
+// Al cancelar una espera, POSIX recupera el mutex antes de ejecutar esta limpieza.
+// Un cliente en fila deja su lugar; uno sentado comunica el abandono a su mesa.
+static void cliente_limpieza(void* arg){
+    Cliente* cliente = arg;
+    Servidor* servidor = cliente->servidor;
+    if(!cliente->terminado && !servidor->apagar && cliente->mesa < 0){
+        for(int i = servidor->inicio_fila; i < servidor->fin_fila; i++){
+            if(servidor->fila[i] != cliente->id - 1) continue;
+            servidor->fin_fila--;
+            memmove(&servidor->fila[i], &servidor->fila[i+1], (size_t)(servidor->fin_fila-i) * sizeof(*servidor->fila));
+            servidor->completados++;
+            cliente->terminado = true;
+            pthread_cond_broadcast(&servidor->cambio);
+            break;
+        }
+    }
+    if(!cliente->terminado && !servidor->apagar && cliente->mesa >= 0){
+        Mesa* mesa = &servidor->mesas[cliente->mesa];
+        pthread_mutex_lock(&mesa->mutex);
+        if(mesa->resultado == RES_JUGANDO && mesa->abandono < 0){
+            mesa->abandono = cliente->rol;
+            registrar_mesa(mesa, "jugador %d desconectado.\n", cliente->id);
+            despertar_mesa(mesa);
+        }
+        pthread_mutex_unlock(&mesa->mutex);
+    }
+    pthread_mutex_unlock(&servidor->mutex);
+}
 
 static void cliente_esperar_mesa(Cliente* cliente){
     Servidor* servidor = cliente->servidor;
@@ -200,25 +228,39 @@ static void cliente_esperar_mesa(Cliente* cliente){
         pthread_cond_wait(&servidor->cambio, &servidor->mutex);
 }
 
+// El cliente configurado para abandonar espera hasta su plazo.
+// Al vencer, pthread_exit ejecuta la limpieza y avisa al juez.
 static void cliente_esperar_resultado(Cliente* cliente){
     Servidor* servidor = cliente->servidor;
-    while(!cliente->terminado && !servidor->apagar)
-        pthread_cond_wait(&servidor->cambio, &servidor->mutex);
+    while(!cliente->terminado && !servidor->apagar){
+        if(cliente->id != servidor->config.abandon_player){
+            pthread_cond_wait(&servidor->cambio, &servidor->mutex);
+            continue;
+        }
+        struct timespec plazo = sumar_ms(cliente->sentado_en, servidor->config.abandon_after_ms);
+        struct timespec ahora = ahora_ts();
+        if(ahora.tv_sec > plazo.tv_sec || (ahora.tv_sec == plazo.tv_sec && ahora.tv_nsec >= plazo.tv_nsec))
+            pthread_exit(NULL);
+        pthread_cond_timedwait(&servidor->cambio, &servidor->mutex, &plazo);
+    }
 }
 
 static void* hilo_cliente(void* arg){
     Cliente* cliente = arg;
     Servidor* servidor = cliente->servidor;
     pthread_mutex_lock(&servidor->mutex);
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+    pthread_cleanup_push(cliente_limpieza, cliente);
     if(!servidor->apagar){
         servidor->fila[servidor->fin_fila++] = cliente->id - 1;
         servidor->llegados++;
         printf("[Servidor] Llega jugador %d.\n", cliente->id);
         pthread_cond_broadcast(&servidor->cambio);
+        pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
         cliente_esperar_mesa(cliente);
         cliente_esperar_resultado(cliente);
     }
-    pthread_mutex_unlock(&servidor->mutex);
+    pthread_cleanup_pop(1);
     return NULL;
 }
 
@@ -549,10 +591,6 @@ static int leer_argumentos(Servidor* servidor, int argc, char** argv){
     configuracion_inicial(&servidor->config);
     if(argc == 4 && cargar_configuracion(&servidor->config, argv[3], detalle, sizeof(detalle)) != 0){
         fprintf(stderr, "Configuracion: %s\n", detalle);
-        return -1;
-    }
-    if(servidor->config.abandon_player != 0){
-        fprintf(stderr, "Esta version requiere abandon_player=0.\n");
         return -1;
     }
     if(servidor->config.abandon_player > servidor->total){
