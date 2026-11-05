@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -78,9 +79,10 @@ struct Servidor {
     int* fila;                   // clientes esperando pareja, en orden de llegada
     int inicio_fila, fin_fila, llegados, completados, activas, pico;
     unsigned int partidas;
-    bool apagar, fallo;
+    bool apagar, fallo, fin;
     pthread_mutex_t mutex;
     pthread_cond_t cambio;       //"algo cambio": llegada, mesa asignada, partida terminada o apagado
+    sigset_t senales;
     bool bloqueos_listos;        // permite limpiar una inicializacion parcial
     int mesas_listas;
     Estadisticas est;
@@ -190,6 +192,28 @@ static void servidor_apagar(Servidor* servidor){
     pthread_cond_broadcast(&servidor->cambio);
 }
 
+static void* hilo_senales(void* arg){
+    Servidor* servidor = arg;
+    // SIGUSR1 es el aviso interno de fin. Durante el torneo se ignora.
+    int sig = 0;
+    int error;
+    for(;;){
+        error = sigwait(&servidor->senales, &sig);
+        pthread_mutex_lock(&servidor->mutex);
+        if(error || sig != SIGUSR1) break;
+        bool fin = servidor->fin;
+        pthread_mutex_unlock(&servidor->mutex);
+        if(fin) return NULL;
+    }
+    if(error != 0){
+        servidor->fallo = true;
+        printf("[Servidor] error esperando senales: %s.\n", strerror(error));
+    } else
+        printf("[Servidor] senal %d: no se aceptan mas jugadores y se cierran las partidas.\n", sig);
+    servidor_apagar(servidor);
+    pthread_mutex_unlock(&servidor->mutex);
+    return NULL;
+}
 
 // Clientes.
 
@@ -608,10 +632,17 @@ static int servidor_reservar(Servidor* servidor){
     return servidor->clientes && servidor->fila && servidor->mesas ? 0 : ENOMEM;
 }
 
+// Todos los hilos heredan las señales bloqueadas. Solo hilo_senales las recibe.
 // El servidor registra los recursos inicializados para poder limpiar tras un error.
 static int servidor_iniciar(Servidor* servidor){
     pthread_condattr_t at;
-    int error = pthread_condattr_init(&at);
+    sigemptyset(&servidor->senales);
+    sigaddset(&servidor->senales, SIGINT);
+    sigaddset(&servidor->senales, SIGTERM);
+    sigaddset(&servidor->senales, SIGUSR1);
+    int error = pthread_sigmask(SIG_BLOCK, &servidor->senales, NULL);
+    if(error == 0)
+        error = pthread_condattr_init(&at);
     if(error != 0)
         return error;
     error = pthread_condattr_setclock(&at, CLOCK_MONOTONIC); // mismo reloj que usan los plazos
@@ -652,7 +683,7 @@ static void crear_clientes(Servidor* servidor){
         Cliente* cliente = &servidor->clientes[i];
         *cliente = (Cliente){.servidor = servidor, .id = i + 1, .mesa = -1};
         pthread_mutex_lock(&servidor->mutex);
-        bool apagar = servidor->apagar; // Se detiene la admision si falla el servidor.
+        bool apagar = servidor->apagar; // si llego Ctrl+C no entra nadie mas
         pthread_mutex_unlock(&servidor->mutex);
         if(apagar)
             break;
@@ -670,9 +701,13 @@ static void crear_clientes(Servidor* servidor){
 }
 
 static int servidor_correr(Servidor* servidor){
+    pthread_t hilo_sig;
+    int error = pthread_create(&hilo_sig, NULL, hilo_senales, servidor);
+    if(error != 0)
+        return error;
     servidor->inicio_ns = ahora_ns();
     pthread_t parejas;
-    int error = pthread_create(&parejas, NULL, emparejar, servidor);
+    error = pthread_create(&parejas, NULL, emparejar, servidor);
     if(error == 0){
         crear_clientes(servidor);
         pthread_join(parejas, NULL);
@@ -683,6 +718,11 @@ static int servidor_correr(Servidor* servidor){
     for(int i = 0; i < servidor->cantidad_mesas; i++)
         if(servidor->mesas[i].creado)
             pthread_join(servidor->mesas[i].juez, NULL);
+    pthread_mutex_lock(&servidor->mutex);
+    servidor->fin = true;
+    pthread_mutex_unlock(&servidor->mutex);
+    pthread_kill(hilo_sig, SIGUSR1); // Despierta al hilo de señales si sigue esperando el fin normal.
+    pthread_join(hilo_sig, NULL);
     imprimir_resumen(servidor);
     return servidor->fallo ? EIO : error;
 }
