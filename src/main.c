@@ -49,14 +49,51 @@ static int leer_argumentos(Servidor* servidor, int argc, char** argv){
     return 0;
 }
 
+static uint32_t azar_siguiente(uint32_t* estado){
+    uint32_t x = *estado; // xorshift32
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *estado = x;
+    return x;
+}
+
 int main(int argc, char** argv){
     Servidor servidor = {0};
     if(leer_argumentos(&servidor, argc, argv) != 0)
         return EXIT_FAILURE;
     preparar_grafo();
+    if(servidor.total != 2 || servidor.capacidad != 1 || servidor.config.abandon_player != 0){
+        fprintf(stderr, "Esta version admite N=2, M=1 y abandon_player=0.\n");
+        return EXIT_FAILURE;
+    }
     Tablero tablero;
     iniciar_tablero(&tablero, servidor.config.puma, servidor.config.dogs);
-    printf("Configuracion cargada: %d jugadores, limite %d mesas.\n", servidor.total, servidor.capacidad);
+    uint32_t azar = servidor.config.seed ? servidor.config.seed : 1;
+    Resultado resultado = resultado_tablero(&tablero);
+    unsigned long movimientos = 0;
+    while(resultado == RES_JUGANDO){
+        for(int ficha = 1; ficha <= FICHAS && resultado == RES_JUGANDO; ficha++){
+            Jugada jugadas[CASILLAS];
+            int cantidad = jugadas_validas(&tablero, ficha, jugadas);
+            if(ficha == PUMA){
+                int capturas = 0;
+                for(int i = 0; i < cantidad; i++)
+                    if(es_salto(jugadas[i])) jugadas[capturas++] = jugadas[i];
+                if(capturas) cantidad = capturas;
+            }
+            if(!cantidad) continue;
+            Jugada jugada = jugadas[azar_siguiente(&azar) % (unsigned int)cantidad];
+            int comio;
+            if(aplicar_jugada(&tablero, ficha, jugada, &comio)){
+                movimientos++;
+                resultado = resultado_tablero(&tablero);
+                if(comio || movimientos % (unsigned int)servidor.config.log_every == 0)
+                    imprimir_tablero(&tablero, stdout);
+            }
+        }
+    }
     imprimir_tablero(&tablero, stdout);
+    printf("Gana %s. Movimientos: %lu.\n", resultado == RES_PUMA ? "Puma" : "Perros", movimientos);
     return EXIT_SUCCESS;
 }
