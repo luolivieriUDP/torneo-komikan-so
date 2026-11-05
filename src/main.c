@@ -78,6 +78,11 @@ static struct timespec ahora_ts(void){
     return t;
 }
 
+static long long ahora_ns(void){
+    struct timespec t = ahora_ts();
+    return (long long)t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+
 static struct timespec sumar_ms(struct timespec t, int ms){
     t.tv_sec += ms / 1000;
     t.tv_nsec += (long)(ms % 1000) * 1000000L;
@@ -175,6 +180,17 @@ static bool ficha_elegir(Ficha* ficha, Jugada* elegida){
     return true;
 }
 
+static void ficha_pedir(Ficha* ficha, Jugada jugada){
+    Mesa* mesa = ficha->mesa;
+    int cola_fin = (mesa->inicio_cola + mesa->pedidos_en_cola) % FICHAS;
+    mesa->cola[cola_fin] = (Pedido){ficha->numero, jugada, ahora_ns()};
+    mesa->pedidos_en_cola++;
+    mesa->pendiente[ficha->numero] = true;
+    pthread_cond_signal(&mesa->aviso[AVISO_JUEZ]); // solo el juez espera pedidos
+    while(mesa->pendiente[ficha->numero] && partida_activa(mesa))
+        pthread_cond_wait(&mesa->aviso[ficha->numero], &mesa->mutex);
+}
+
 static void* hilo_ficha(void* arg){
     Ficha* ficha = arg;
     Mesa* mesa = ficha->mesa;
@@ -182,20 +198,45 @@ static void* hilo_ficha(void* arg){
     while(partida_activa(mesa)){
         if(!ficha_dormir(ficha)) break;
         Jugada jugada;
-        if(ficha_elegir(ficha, &jugada)){
-            int comio;
-            if(aplicar_jugada(&mesa->tablero, ficha->numero, jugada, &comio)){
-                mesa->movimientos++;
-                mesa->resultado = resultado_tablero(&mesa->tablero);
-                if(comio || mesa->movimientos % (unsigned int)mesa->servidor->config.log_every == 0)
-                    imprimir_tablero(&mesa->tablero, stdout);
-            }
-        } else if(!ficha_viva(mesa, ficha->numero))
-            break;
+        if(ficha_elegir(ficha, &jugada))
+            ficha_pedir(ficha, jugada);
+        else if(!ficha_viva(mesa, ficha->numero))
+            break; // El perro fue capturado.
     }
-    despertar_mesa(mesa);
     pthread_mutex_unlock(&mesa->mutex);
     return NULL;
+}
+
+static Resultado resultado_externo(const Mesa* mesa){
+    if(mesa->apagar)
+        return RES_INTERRUMPIDA;
+    if(mesa->abandono >= 0)
+        return mesa->abandono == JUEGA_PUMA ? RES_PERROS : RES_PUMA;
+    return RES_JUGANDO;
+}
+
+static void juez_imprimir(Mesa* mesa, const char* linea, bool con_tablero){
+    Tablero foto = mesa->tablero;
+    unsigned long movs = mesa->movimientos;
+    pthread_mutex_unlock(&mesa->mutex);
+    flockfile(stdout);
+    if(linea)
+        printf("[Mesa %d | partida %u] %s", mesa->id, mesa->partida, linea);
+    if(con_tablero){
+        printf("[Mesa %d | partida %u] Tablero, movimiento %lu, capturas %d:\n",
+               mesa->id, mesa->partida, movs, foto.capturas);
+        imprimir_tablero(&foto, stdout);
+    }
+    funlockfile(stdout);
+    pthread_mutex_lock(&mesa->mutex);
+}
+
+static void juez_iniciar(Mesa* mesa){
+    iniciar_tablero(&mesa->tablero, mesa->servidor->config.puma, mesa->servidor->config.dogs);
+    mesa->resultado = resultado_externo(mesa);
+    if(mesa->resultado == RES_JUGANDO)
+        mesa->resultado = resultado_tablero(&mesa->tablero);
+    juez_imprimir(mesa, NULL, true);
 }
 
 static int juez_crear_fichas(Mesa* mesa, pthread_t* hilos){
@@ -215,6 +256,47 @@ static int juez_crear_fichas(Mesa* mesa, pthread_t* hilos){
     return creadas;
 }
 
+static void juez_atender(Mesa* mesa){
+    Pedido pedido = mesa->cola[mesa->inicio_cola];
+    mesa->inicio_cola = (mesa->inicio_cola + 1) % FICHAS;
+    mesa->pedidos_en_cola--;
+    int comio = 0;
+    bool movio = aplicar_jugada(&mesa->tablero, pedido.ficha, pedido.jugada, &comio);
+    mesa->pendiente[pedido.ficha] = false;
+    pthread_cond_signal(&mesa->aviso[pedido.ficha]);
+    long long espera = ahora_ns() - pedido.envio_ns;
+    mesa->latencia_total += espera;
+    if(espera > mesa->latencia_maxima)
+        mesa->latencia_maxima = espera;
+    char linea[96];
+    if(movio){
+        mesa->movimientos++;
+        mesa->resultado = resultado_tablero(&mesa->tablero);
+        if(comio || mesa->movimientos % (unsigned int)mesa->servidor->config.log_every == 0){
+            snprintf(linea, sizeof(linea), "Ficha %d: %d -> %d%s.\n", pedido.ficha, pedido.jugada.origen,
+                     pedido.jugada.destino, comio ? " (captura)" : "");
+            juez_imprimir(mesa, linea, true);
+        }
+    } else {
+        mesa->rechazos++; // la casilla ya no estaba libre o el pedido quedo obsoleto
+        if(MOSTRAR_RECHAZOS){
+            snprintf(linea, sizeof(linea), "Ficha %d: %d -> %d rechazado.\n", pedido.ficha,
+                     pedido.jugada.origen, pedido.jugada.destino);
+            juez_imprimir(mesa, linea, false);
+        }
+    }
+}
+
+static void juez_paso(Mesa* mesa){
+    Resultado externo = resultado_externo(mesa);
+    if(externo != RES_JUGANDO)
+        mesa->resultado = externo;
+    else if(mesa->pedidos_en_cola > 0)
+        juez_atender(mesa);
+    else
+        pthread_cond_wait(&mesa->aviso[AVISO_JUEZ], &mesa->mutex);
+}
+
 static void juez_anunciar_fin(Mesa* mesa){
     if(mesa->resultado == RES_PUMA || mesa->resultado == RES_PERROS){
         int rol = mesa->resultado == RES_PUMA ? JUEGA_PUMA : JUEGAN_PERROS;
@@ -225,6 +307,22 @@ static void juez_anunciar_fin(Mesa* mesa){
     } else
         registrar_mesa(mesa, "Partida %s.\n", mesa->resultado == RES_INTERRUMPIDA ? "interrumpida" : "abortada por error");
     registrar_mesa(mesa, "movimientos aceptados: %lu, rechazados: %lu.\n", mesa->movimientos, mesa->rechazos);
+}
+
+static void* hilo_juez(void* arg){
+    Mesa* mesa = arg;
+    pthread_t hilos[FICHAS];
+    pthread_mutex_lock(&mesa->mutex);
+    juez_iniciar(mesa);
+    int creadas = juez_crear_fichas(mesa, hilos);
+    while(mesa->resultado == RES_JUGANDO)
+        juez_paso(mesa);
+    despertar_mesa(mesa);
+    juez_imprimir(mesa, NULL, true);
+    juez_anunciar_fin(mesa);
+    pthread_mutex_unlock(&mesa->mutex);
+    for(int i = 0; i < creadas; i++) pthread_join(hilos[i], NULL);
+    return NULL;
 }
 
 static int leer_argumentos(Servidor* servidor, int argc, char** argv){
@@ -268,16 +366,11 @@ int main(int argc, char** argv){
         fprintf(stderr, "No se pudo iniciar la mesa: %s.\n", strerror(error));
         return EXIT_FAILURE;
     }
-    iniciar_tablero(&mesa.tablero, servidor.config.puma, servidor.config.dogs);
-    mesa.resultado = resultado_tablero(&mesa.tablero);
-    pthread_t hilos[FICHAS];
-    pthread_mutex_lock(&mesa.mutex);
-    int creadas = juez_crear_fichas(&mesa, hilos);
-    despertar_mesa(&mesa);
-    pthread_mutex_unlock(&mesa.mutex);
-    for(int i = 0; i < creadas; i++) pthread_join(hilos[i], NULL);
-    imprimir_tablero(&mesa.tablero, stdout);
-    juez_anunciar_fin(&mesa);
+    error = pthread_create(&mesa.juez, NULL, hilo_juez, &mesa);
+    if(error == 0)
+        pthread_join(mesa.juez, NULL);
+    else
+        fprintf(stderr, "No se pudo crear el juez: %s.\n", strerror(error));
     mesa_destruir_bloqueos(&mesa);
     return error == 0 && mesa.resultado != RES_ERROR ? EXIT_SUCCESS : EXIT_FAILURE;
 }
