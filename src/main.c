@@ -15,10 +15,87 @@
 #include "config.h"
 #include "tablero.h"
 
+enum { AVISO_JUEZ = 0 };
+
+#ifndef MOSTRAR_RECHAZOS
+#define MOSTRAR_RECHAZOS 0      // Activar con -DMOSTRAR_RECHAZOS=1 para registrar las jugadas rechazadas.
+#endif
+
+typedef struct Servidor Servidor;
+typedef struct Mesa Mesa;
+enum { JUEGA_PUMA = 0, JUEGAN_PERROS = 1 };
+
 typedef struct {
+    Mesa* mesa;
+    int numero;                  // 1 corresponde al Puma y 2..13 a los perros.
+    uint32_t azar;               // Cada ficha mantiene su propia secuencia aleatoria.
+} Ficha;
+
+typedef struct {
+    int ficha;
+    Jugada jugada;
+    long long envio_ns;           // Instante en que se encolo el pedido, en nanosegundos.
+} Pedido;
+
+struct Mesa {
+    Servidor* servidor;
+    int id, jugadores[2];        // jugadores[rol] = id del cliente
+    unsigned int partida;
+    pthread_t juez;
+    bool creado, ocupada;
+    pthread_mutex_t mutex;       // protege el estado de la partida
+    pthread_cond_t aviso[FICHAS + 1]; // 0 para el juez, 1..13 para cada ficha
+    Tablero tablero;
+    Resultado resultado;
+    bool apagar;
+    int abandono;                // -1 nadie, 0 puma, 1 perros
+    unsigned long movimientos, rechazos;
+    long long latencia_total, latencia_maxima;
+    Pedido cola[FICHAS];    // Cada ficha espera su respuesta antes de enviar otro pedido.
+    int inicio_cola, pedidos_en_cola;
+    bool pendiente[FICHAS + 1];
+    Ficha fichas[FICHAS];
+};
+
+struct Servidor {
     Config config;
     int total, capacidad;
-} Servidor;
+};
+
+static void registrar_mesa(const Mesa* mesa, const char* fmt, ...){
+    va_list args;
+    flockfile(stdout);
+    printf("[Mesa %d | partida %u] ", mesa->id, mesa->partida);
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+    funlockfile(stdout);
+}
+
+static struct timespec ahora_ts(void){
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t;
+}
+
+static struct timespec sumar_ms(struct timespec t, int ms){
+    t.tv_sec += ms / 1000;
+    t.tv_nsec += (long)(ms % 1000) * 1000000L;
+    if(t.tv_nsec >= 1000000000L){
+        t.tv_sec++;
+        t.tv_nsec -= 1000000000L;
+    }
+    return t;
+}
+
+static uint32_t azar_siguiente(uint32_t* estado){
+    uint32_t x = *estado; // xorshift32
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *estado = x;
+    return x;
+}
 
 static int entero_positivo(const char* texto, int* valor){
     char* fin;
@@ -28,6 +105,126 @@ static int entero_positivo(const char* texto, int* valor){
         return -1;
     *valor = (int)leido;
     return 0;
+}
+
+static bool partida_activa(const Mesa* mesa){
+    return mesa->resultado == RES_JUGANDO && !mesa->apagar && mesa->abandono < 0;
+}
+
+static void despertar_mesa(Mesa* mesa){
+    for(int i = 0; i <= FICHAS; i++)
+        pthread_cond_broadcast(&mesa->aviso[i]);
+}
+
+static int mesa_iniciar_bloqueos(Mesa* mesa, const pthread_condattr_t* at){
+    int inicializadas = 0;
+    int error = pthread_mutex_init(&mesa->mutex, NULL);
+    if(error != 0)
+        return error;
+    while(error == 0 && inicializadas <= FICHAS){
+        error = pthread_cond_init(&mesa->aviso[inicializadas], at);
+        if(error == 0)
+            inicializadas++;
+    }
+    if(error != 0){ // Si falla una inicializacion, se deshacen las anteriores.
+        while(inicializadas-- > 0)
+            pthread_cond_destroy(&mesa->aviso[inicializadas]);
+        pthread_mutex_destroy(&mesa->mutex);
+    }
+    return error;
+}
+
+static void mesa_destruir_bloqueos(Mesa* mesa){
+    for(int i = 0; i <= FICHAS; i++)
+        pthread_cond_destroy(&mesa->aviso[i]);
+    pthread_mutex_destroy(&mesa->mutex);
+}
+
+static bool ficha_viva(const Mesa* mesa, int numero){
+    for(int i = 0; i < CASILLAS; i++)
+        if(mesa->tablero.casillas[i] == numero)
+            return true;
+    return false;
+}
+
+static bool ficha_dormir(Ficha* ficha){
+    Mesa* mesa = ficha->mesa;
+    const Config* config = &mesa->servidor->config;
+    unsigned int rango = (unsigned int)(config->max_delay_ms - config->min_delay_ms + 1);
+    int retardo = config->min_delay_ms + (int)(azar_siguiente(&ficha->azar) % rango);
+    struct timespec plazo = sumar_ms(ahora_ts(), retardo);
+    int error = 0;
+    while(error != ETIMEDOUT && partida_activa(mesa))
+        error = pthread_cond_timedwait(&mesa->aviso[ficha->numero], &mesa->mutex, &plazo);
+    return partida_activa(mesa);
+}
+
+static bool ficha_elegir(Ficha* ficha, Jugada* elegida){
+    Jugada jugadas[CASILLAS];
+    int cantidad = jugadas_validas(&ficha->mesa->tablero, ficha->numero, jugadas);
+    if(ficha->numero == PUMA){
+        int capturas = 0;
+        for(int i = 0; i < cantidad; i++)
+            if(es_salto(jugadas[i]))
+                jugadas[capturas++] = jugadas[i];
+        if(capturas > 0) cantidad = capturas;
+    }
+    if(cantidad == 0)
+        return false;
+    *elegida = jugadas[azar_siguiente(&ficha->azar) % (unsigned int)cantidad];
+    return true;
+}
+
+static void* hilo_ficha(void* arg){
+    Ficha* ficha = arg;
+    Mesa* mesa = ficha->mesa;
+    pthread_mutex_lock(&mesa->mutex);
+    while(partida_activa(mesa)){
+        if(!ficha_dormir(ficha)) break;
+        Jugada jugada;
+        if(ficha_elegir(ficha, &jugada)){
+            int comio;
+            if(aplicar_jugada(&mesa->tablero, ficha->numero, jugada, &comio)){
+                mesa->movimientos++;
+                mesa->resultado = resultado_tablero(&mesa->tablero);
+                if(comio || mesa->movimientos % (unsigned int)mesa->servidor->config.log_every == 0)
+                    imprimir_tablero(&mesa->tablero, stdout);
+            }
+        } else if(!ficha_viva(mesa, ficha->numero))
+            break;
+    }
+    despertar_mesa(mesa);
+    pthread_mutex_unlock(&mesa->mutex);
+    return NULL;
+}
+
+static int juez_crear_fichas(Mesa* mesa, pthread_t* hilos){
+    int creadas = 0;
+    for(int i = 0; i < FICHAS && mesa->resultado == RES_JUGANDO; i++){
+        uint32_t semilla = mesa->servidor->config.seed ^ (mesa->partida * UINT32_C(2654435761)) ^
+                           ((uint32_t)(i + 1) * UINT32_C(2246822519));
+        mesa->fichas[i] = (Ficha){mesa, i + 1, semilla ? semilla : 1};
+        int error = pthread_create(&hilos[i], NULL, hilo_ficha, &mesa->fichas[i]);
+        if(error != 0){
+            registrar_mesa(mesa, "no se pudo crear una ficha: %s.\n", strerror(error));
+            mesa->resultado = RES_ERROR;
+            break;
+        }
+        creadas++;
+    }
+    return creadas;
+}
+
+static void juez_anunciar_fin(Mesa* mesa){
+    if(mesa->resultado == RES_PUMA || mesa->resultado == RES_PERROS){
+        int rol = mesa->resultado == RES_PUMA ? JUEGA_PUMA : JUEGAN_PERROS;
+        const char* ganador = rol == JUEGA_PUMA ? "Puma" : "Perros";
+        const char* motivo = rol == JUEGA_PUMA ? "6 capturas" : "acorralamiento";
+        if(mesa->abandono >= 0) motivo = "abandono";
+        registrar_mesa(mesa, "Gana %s (jugador %d) por %s.\n", ganador, mesa->jugadores[rol], motivo);
+    } else
+        registrar_mesa(mesa, "Partida %s.\n", mesa->resultado == RES_INTERRUMPIDA ? "interrumpida" : "abortada por error");
+    registrar_mesa(mesa, "movimientos aceptados: %lu, rechazados: %lu.\n", mesa->movimientos, mesa->rechazos);
 }
 
 static int leer_argumentos(Servidor* servidor, int argc, char** argv){
@@ -49,15 +246,6 @@ static int leer_argumentos(Servidor* servidor, int argc, char** argv){
     return 0;
 }
 
-static uint32_t azar_siguiente(uint32_t* estado){
-    uint32_t x = *estado; // xorshift32
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    *estado = x;
-    return x;
-}
-
 int main(int argc, char** argv){
     Servidor servidor = {0};
     if(leer_argumentos(&servidor, argc, argv) != 0)
@@ -67,33 +255,29 @@ int main(int argc, char** argv){
         fprintf(stderr, "Esta version admite N=2, M=1 y abandon_player=0.\n");
         return EXIT_FAILURE;
     }
-    Tablero tablero;
-    iniciar_tablero(&tablero, servidor.config.puma, servidor.config.dogs);
-    uint32_t azar = servidor.config.seed ? servidor.config.seed : 1;
-    Resultado resultado = resultado_tablero(&tablero);
-    unsigned long movimientos = 0;
-    while(resultado == RES_JUGANDO){
-        for(int ficha = 1; ficha <= FICHAS && resultado == RES_JUGANDO; ficha++){
-            Jugada jugadas[CASILLAS];
-            int cantidad = jugadas_validas(&tablero, ficha, jugadas);
-            if(ficha == PUMA){
-                int capturas = 0;
-                for(int i = 0; i < cantidad; i++)
-                    if(es_salto(jugadas[i])) jugadas[capturas++] = jugadas[i];
-                if(capturas) cantidad = capturas;
-            }
-            if(!cantidad) continue;
-            Jugada jugada = jugadas[azar_siguiente(&azar) % (unsigned int)cantidad];
-            int comio;
-            if(aplicar_jugada(&tablero, ficha, jugada, &comio)){
-                movimientos++;
-                resultado = resultado_tablero(&tablero);
-                if(comio || movimientos % (unsigned int)servidor.config.log_every == 0)
-                    imprimir_tablero(&tablero, stdout);
-            }
-        }
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    Mesa mesa = {.servidor = &servidor, .id = 1, .partida = 1,
+                 .jugadores = {1, 2}, .abandono = -1};
+    pthread_condattr_t at;
+    int error = pthread_condattr_init(&at);
+    if(error != 0) return EXIT_FAILURE;
+    error = pthread_condattr_setclock(&at, CLOCK_MONOTONIC);
+    if(error == 0) error = mesa_iniciar_bloqueos(&mesa, &at);
+    pthread_condattr_destroy(&at);
+    if(error != 0){
+        fprintf(stderr, "No se pudo iniciar la mesa: %s.\n", strerror(error));
+        return EXIT_FAILURE;
     }
-    imprimir_tablero(&tablero, stdout);
-    printf("Gana %s. Movimientos: %lu.\n", resultado == RES_PUMA ? "Puma" : "Perros", movimientos);
-    return EXIT_SUCCESS;
+    iniciar_tablero(&mesa.tablero, servidor.config.puma, servidor.config.dogs);
+    mesa.resultado = resultado_tablero(&mesa.tablero);
+    pthread_t hilos[FICHAS];
+    pthread_mutex_lock(&mesa.mutex);
+    int creadas = juez_crear_fichas(&mesa, hilos);
+    despertar_mesa(&mesa);
+    pthread_mutex_unlock(&mesa.mutex);
+    for(int i = 0; i < creadas; i++) pthread_join(hilos[i], NULL);
+    imprimir_tablero(&mesa.tablero, stdout);
+    juez_anunciar_fin(&mesa);
+    mesa_destruir_bloqueos(&mesa);
+    return error == 0 && mesa.resultado != RES_ERROR ? EXIT_SUCCESS : EXIT_FAILURE;
 }
